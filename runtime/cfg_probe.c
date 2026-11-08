@@ -56,6 +56,11 @@ int probe_cfg(void) {
     plat_file_delete(path);
     CHECK(cfg_load(path) == 0, "missing file is not an error");
     CHECK(cfg_get("NX2NAVI_FPS60") == NULL, "missing file leaves no keys");
+    plat_setenv("NX2NAVI_PIPE_SKIP", NULL);
+    CHECK(EQ(cfg_value("NX2NAVI_PIPE_SKIP"), "none"), "complete-frame pipeline policy is the default");
+    cfg_set("NX2NAVI_PIPE_SKIP", "fullscreen");
+    CHECK(EQ(cfg_value("NX2NAVI_PIPE_SKIP"), "fullscreen"), "explicit legacy skip policy is preserved");
+    cfg_load(path);
 
     // cfg_set / cfg_save: only changed lines move, comments stay, a missing key goes under its section
     static const char before[] =

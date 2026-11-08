@@ -101,7 +101,17 @@ static int tm_init(void) {
     return TM.ok = ok;
 }
 
-// Views of the scratch images the pass samples, kept for the process (the scratch images live as long).
+// Retire views together with their scratch image. Deferred destruction keeps earlier recorded/submitted uses alive
+// and removing the cache entry prevents a recycled Vulkan image handle from finding a stale view.
+void vk_tonemap_forget_image(VkImage img) {
+    for (int i = 0; i < TM.nviews;) {
+        if (TM.views[i].img != img) { i++; continue; }
+        vk_defer_view(TM.views[i].view);
+        TM.views[i] = TM.views[--TM.nviews];
+    }
+}
+
+// Views of the scratch images the pass samples; removed when fallback_scratch retires the image.
 static VkImageView tm_view(VkImage img, VkFormat f) {
     for (int i = 0; i < TM.nviews; i++)
         if (TM.views[i].img == img && TM.views[i].f == f) return TM.views[i].view;

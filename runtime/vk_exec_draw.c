@@ -2751,18 +2751,23 @@ static void bind_vertex_buffers(VkExec *ex) {
 //   buffer or g-buffer with a colour target the frame before did not use: half-resolution effect buffers in fights).
 //   Passes with none (volumes, LUTs, shadow layers seen for the first time) still wait, and so do passes whose only
 //   recent target is the depth buffer while a colour target is rendered for the first time (item icon captures).
-// fullscreen (2, default): as any, and full-screen draws into such passes are skipped instead of waiting from their
+// fullscreen (2): as any, and full-screen draws into such passes are skipped instead of waiting from their
 //   budget. A full-screen pass whose stage libraries are cold in the driver cache took 86 ms on average (up to 194 ms)
 //   in a fight on an RX 9070: three frames in a row each spent the 50 ms budget, and some of the draws were skipped
 //   after all. Skipping costs the pass for the frames until the pipeline is ready.
+// none (3, default): wait for every draw, using the one-shot timeout. Missing geometry, shadows and post-process
+//   passes can flicker or feed incomplete lighting into temporal history when entering an area. Compilation can
+//   pause a cold frame; the optional skip modes retain the previous latency/visual-completeness tradeoff.
 static int pipe_skip_mode(void) {
     static int mode = -1;
     if (mode < 0) {
         const char *e = cfg_value("NX2NAVI_PIPE_SKIP");
-        mode = !strcmp(e, "strict") || !strcmp(e, "0") ? 0 : !strcmp(e, "fullscreen") || !strcmp(e, "2") ? 2 : 1;
-        static const char *const what[3] = {"only draws into per-frame passes (NX2NAVI_PIPE_SKIP=strict)",
+        mode = !strcmp(e, "none") || !strcmp(e, "3") ? 3 :
+               !strcmp(e, "strict") || !strcmp(e, "0") ? 0 : !strcmp(e, "fullscreen") || !strcmp(e, "2") ? 2 : 1;
+        static const char *const what[4] = {"only draws into per-frame passes (NX2NAVI_PIPE_SKIP=strict)",
                                             "draws into passes with a target the previous frame rendered",
-                                            "those and full-screen draws (NX2NAVI_PIPE_SKIP=fullscreen)"};
+                                            "those and full-screen draws (NX2NAVI_PIPE_SKIP=fullscreen)",
+                                            "none before the compilation timeout (NX2NAVI_PIPE_SKIP=none)"};
         rt_log("vk_exec: draws skipped while their pipeline builds: %s", what[mode]);
     }
     return mode;
@@ -2903,12 +2908,13 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
             memo_key(ex, gen, &SM.k), SM.vs = vs, SM.fs = fs, SM.has_fs = has_fs, SM.valid = 1;
     }
     if (!has_vs) return draw_skipped(ex, mesh, SK_NO_VERTEX_STAGE);
-    // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
+    // With a skip policy enabled, a draw into a target the previous frame did not render (or into none) still waits:
     // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
     // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
     int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
+    if (skip == 3) oneshot = 1;   // preserve every pass, including recurring targets
     if (vs_wait || fs_wait || ts_wait) {
-        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1)))   // skipped until ready
+        if (!(oneshot = skip == 3 || !vk_exec_targets_recent(ex, skip >= 1)))   // skipped until ready
             return perf_count(PERF_CNT_SHADER_SKIP), draw_skipped(ex, mesh, SK_SHADER_PENDING);
         perf_count(PERF_CNT_ONESHOT_WAIT);
         if (vs_wait) vs = shader_for(ex, vst, &has_vs, NULL, 1);
@@ -2928,10 +2934,10 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     s.prim_restart = (uint8_t)(restart != 0);
     const VkPipeInfo *info = NULL;
     int pending;
-    // A draw of at most 6 vertices over half the render area or more (a full-screen triangle or quad, a tile) waits for
+    // In the optional skip modes, a draw of at most 6 vertices over half the render area or more waits for
     // its pipeline: skipping it can leave a black tile. The waits share 50 ms per presented frame
-    // (NX2NAVI_PIPE_SKIP=fullscreen skips them instead). A one-shot draw waits without that budget. Everything else is
-    // skipped while its pipeline is built.
+    // (NX2NAVI_PIPE_SKIP=fullscreen skips them instead). A one-shot draw, or every draw with PIPE_SKIP=none, waits
+    // without that frame budget, up to ONESHOT_WAIT_MS.
     static uint64_t wait_frame;
     static uint64_t wait_left_ns;
     uint32_t wait_ms = 0;
@@ -4006,12 +4012,22 @@ static int fmt_rgba8(VkFormat f) {
            f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_A8B8G8R8_UNORM_PACK32 || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
 }
 
-// Scratch images for those blits, one per (size, format), kept for the life of the process (a handful).
+// Scratch images for those blits. Recycle the least recently used entry when resolutions fill the cache; refusing
+// a ninth size/format silently bypasses RGB9E5 decoding and interprets packed colour words as R11G11B10 floats.
 static VkImage fallback_scratch(VkExec *ex, uint32_t w, uint32_t h, VkFormat f) {
-    static struct { uint32_t w, h; VkFormat f; VkImage img; VmaAllocation a; } cache[8];
+    static struct { uint32_t w, h; VkFormat f; VkImage img; VmaAllocation a; uint64_t used; } cache[8];
     static int n;
-    for (int i = 0; i < n; i++) if (cache[i].w == w && cache[i].h == h && cache[i].f == f) return cache[i].img;
-    if (n == 8) return VK_NULL_HANDLE;
+    static uint64_t serial;
+    uint64_t used = ++serial;
+    int slot = 0;
+    for (int i = 0; i < n; i++) {
+        if (cache[i].w == w && cache[i].h == h && cache[i].f == f) {
+            cache[i].used = used;
+            return cache[i].img;
+        }
+        if (cache[i].used < cache[slot].used) slot = i;
+    }
+    if (n < 8) slot = n;
     VkCtx *c = vk_ctx();
     VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
                             .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -4030,7 +4046,12 @@ static VkImage fallback_scratch(VkExec *ex, uint32_t w, uint32_t h, VkFormat f) 
                                  .image = img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &bar};
     vkCmdPipelineBarrier2(ex->cb, &di);
-    cache[n].w = w, cache[n].h = h, cache[n].f = f, cache[n].img = img, cache[n].a = a, n++;
+    if (slot < n) {
+        vk_tonemap_forget_image(cache[slot].img);
+        vk_defer_image(cache[slot].img, cache[slot].a);
+    } else n++;
+    cache[slot].w = w, cache[slot].h = h, cache[slot].f = f;
+    cache[slot].img = img, cache[slot].a = a, cache[slot].used = used;
     return img;
 }
 

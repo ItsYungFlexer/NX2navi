@@ -45,9 +45,10 @@
 # Shaders and pipelines.
 # Draws whose pipeline is still building: default waits on a reserved worker; draw is the previous scheduling.
 # pipe_wait = default
-# Which draws are dropped instead of waiting for their pipeline: strict (only draws into per-frame passes), any (also
-# draws into passes whose target the previous frame rendered) or fullscreen (those and full-screen draws).
-# pipe_skip = fullscreen
+# Which draws are dropped instead of waiting for their pipeline: none (default, complete frames; cold compilation
+# can pause), strict (only draws into per-frame passes), any (also draws into passes whose target the previous frame
+# rendered) or fullscreen (those and full-screen draws). All waits retain a 30-second compilation timeout.
+# pipe_skip = none
 # Build shader stage libraries in the background ahead of time, and the threads for it (1 to 16; default: a quarter of
 # the CPU threads).
 # lib_prebuild = 1
